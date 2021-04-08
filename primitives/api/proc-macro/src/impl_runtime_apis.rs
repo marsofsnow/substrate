@@ -282,6 +282,10 @@ fn generate_runtime_api_base_structures() -> Result<TokenStream> {
 				self.recorder = Some(Default::default());
 			}
 
+			fn proof_recorder(&self) -> Option<#crate_::ProofRecorder<Block>>;
+				self.recorder.clone()
+			}
+
 			fn extract_proof(&mut self) -> Option<#crate_::StorageProof> {
 				self.recorder
 					.take()

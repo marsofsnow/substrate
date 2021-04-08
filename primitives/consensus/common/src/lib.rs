@@ -204,6 +204,7 @@ pub trait Proposer<B: BlockT> {
 		inherent_data: InherentData,
 		inherent_digests: DigestFor<B>,
 		max_duration: Duration,
+		block_size_limit: Option<usize>,
 	) -> Self::Proposal;
 }
 

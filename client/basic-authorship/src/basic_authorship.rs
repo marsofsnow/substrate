@@ -42,14 +42,14 @@ use std::marker::PhantomData;
 use prometheus_endpoint::Registry as PrometheusRegistry;
 use sc_proposer_metrics::MetricsLink as PrometheusMetrics;
 
-/// Default maximum block size in bytes used by [`Proposer`].
+/// Default block size limit in bytes used by [`Proposer`].
 ///
-/// Can be overwritten by [`ProposerFactory::set_maximum_block_size`].
+/// Can be overwritten by [`ProposerFactory::set_block_size_limit`].
 ///
 /// Be aware that there is also an upper packet size on what the networking code
 /// will accept. If the block doesn't fit in such a package, it can not be
 /// transferred to other nodes.
-pub const DEFAULT_MAX_BLOCK_SIZE: usize = 4 * 1024 * 1024 + 512;
+pub const DEFAULT_BLOCK_SIZE_LIMIT: usize = 4 * 1024 * 1024 + 512;
 
 /// Proposer factory.
 pub struct ProposerFactory<A, B, C, PR> {
@@ -60,10 +60,16 @@ pub struct ProposerFactory<A, B, C, PR> {
 	transaction_pool: Arc<A>,
 	/// Prometheus Link,
 	metrics: PrometheusMetrics,
-	max_block_size: usize,
+	/// The default block size limit.
+	///
+	/// If no `block_size_limit` is passed to [`Proposer::propose`], this block size limit will be
+	/// used.
+	default_block_size_limit: usize,
 	telemetry: Option<TelemetryHandle>,
 	/// phantom member to pin the `Backend`/`ProofRecording` type.
 	_phantom: PhantomData<(B, PR)>,
+	/// When estimating the block size, should the proof be included?
+	include_proof_in_block_size_estimation: bool,
 }
 
 impl<A, B, C> ProposerFactory<A, B, C, DisableProofRecording> {
@@ -81,10 +87,11 @@ impl<A, B, C> ProposerFactory<A, B, C, DisableProofRecording> {
 			spawn_handle: Box::new(spawn_handle),
 			transaction_pool,
 			metrics: PrometheusMetrics::new(prometheus),
-			max_block_size: DEFAULT_MAX_BLOCK_SIZE,
+			default_block_size_limit: DEFAULT_MAX_BLOCK_SIZE,
 			telemetry,
 			client,
 			_phantom: PhantomData,
+			include_proof_in_block_size_estimation: false,
 		}
 	}
 }
@@ -93,6 +100,8 @@ impl<A, B, C> ProposerFactory<A, B, C, EnableProofRecording> {
 	/// Create a new proposer factory with proof recording enabled.
 	///
 	/// Each proposer created by this instance will record a proof while building a block.
+	///
+	/// This will also include the proof into the estimation of the block size. This can be
 	pub fn with_proof_recording(
 		spawn_handle: impl SpawnNamed + 'static,
 		client: Arc<C>,
@@ -102,23 +111,31 @@ impl<A, B, C> ProposerFactory<A, B, C, EnableProofRecording> {
 	) -> Self {
 		ProposerFactory {
 			spawn_handle: Box::new(spawn_handle),
-			client,
+			default_block_size_limit
 			transaction_pool,
 			metrics: PrometheusMetrics::new(prometheus),
-			max_block_size: DEFAULT_MAX_BLOCK_SIZE,
+			default_block_size_limit: DEFAULT_MAX_BLOCK_SIZE,
 			telemetry,
 			_phantom: PhantomData,
+			include_proof_in_block_size_estimation: true,
 		}
+	}
+
+	/// Disable the proof inclusion when estimating the block size.
+	pub fn disable_proof_in_block_size_estimation(&mut self) {
+		self.include_proof_in_block_size_estimation = false;
 	}
 }
 
 impl<A, B, C, PR> ProposerFactory<A, B, C, PR> {
-	/// Set the maximum block size in bytes.
+	/// Set the default block size limit in bytes.
 	///
-	/// The default value for the maximum block size is:
-	/// [`DEFAULT_MAX_BLOCK_SIZE`].
-	pub fn set_maximum_block_size(&mut self, size: usize) {
-		self.max_block_size = size;
+	/// The default value for the block size limit is:
+	/// [`DEFAULT_BLOCK_SIZE_LIMIT`].
+	///
+	/// If there is no block size limit passed to [`Proposer::propose`], this value will be used.
+	pub fn set_default_block_size_limit(&mut self, limit: usize) {
+		self.default_block_size_limit = limit;
 	}
 }
 
@@ -141,7 +158,7 @@ impl<B, Block, C, A, PR> ProposerFactory<A, B, C, PR>
 
 		let id = BlockId::hash(parent_hash);
 
-		info!("🙌 Starting consensus session on top of parent {:?}", parent_hash);
+		info!("🙌 Starting consdefault_block_size_limiton top of parent {:?}", parent_hash);
 
 		let proposer = Proposer::<_, _, _, _, PR> {
 			spawn_handle: self.spawn_handle.clone(),
@@ -152,7 +169,7 @@ impl<B, Block, C, A, PR> ProposerFactory<A, B, C, PR>
 			transaction_pool: self.transaction_pool.clone(),
 			now,
 			metrics: self.metrics.clone(),
-			max_block_size: self.max_block_size,
+			default_block_size_limit: self.default_block_size_limit,
 			telemetry: self.telemetry.clone(),
 			_phantom: PhantomData,
 		};
@@ -195,7 +212,7 @@ pub struct Proposer<B, Block: BlockT, C, A: TransactionPool, PR> {
 	transaction_pool: Arc<A>,
 	now: Box<dyn Fn() -> time::Instant + Send + Sync>,
 	metrics: PrometheusMetrics,
-	max_block_size: usize,
+	default_block_size_limit: usize,
 	telemetry: Option<TelemetryHandle>,
 	_phantom: PhantomData<(B, PR)>,
 }
@@ -225,6 +242,7 @@ impl<A, B, Block, C, PR> sp_consensus::Proposer<Block> for
 		inherent_data: InherentData,
 		inherent_digests: DigestFor<Block>,
 		max_duration: time::Duration,
+		block_size_limit: Option<usize>,
 	) -> Self::Proposal {
 		let (tx, rx) = oneshot::channel();
 		let spawn_handle = self.spawn_handle.clone();
@@ -236,6 +254,7 @@ impl<A, B, Block, C, PR> sp_consensus::Proposer<Block> for
 				inherent_data,
 				inherent_digests,
 				deadline,
+				block_size_limit,
 			).await;
 			if tx.send(res).is_err() {
 				trace!("Could not send block production result to proposer!");
@@ -264,6 +283,7 @@ impl<A, B, Block, C, PR> Proposer<B, Block, C, A, PR>
 		inherent_data: InherentData,
 		inherent_digests: DigestFor<Block>,
 		deadline: time::Instant,
+		block_size_limit: Option<usize>,
 	) -> Result<Proposal<Block, backend::TransactionFor<B, Block>, PR::Proof>, sp_blockchain::Error> {
 		/// If the block is full we will attempt to push at most
 		/// this number of transactions before quitting for real.
@@ -297,7 +317,9 @@ impl<A, B, Block, C, PR> Proposer<B, Block, C, A, PR>
 		let mut unqueue_invalid = Vec::new();
 
 		let mut t1 = self.transaction_pool.ready_at(self.parent_number).fuse();
-		let mut t2 = futures_timer::Delay::new(deadline.saturating_duration_since((self.now)()) / 8).fuse();
+		let mut t2 = futures_timer::Delay::new(
+			deadline.saturating_duration_since((self.now)()) / 8,
+		).fuse();
 
 		let pending_iterator = select! {
 			res = t1 => res,
@@ -310,6 +332,8 @@ impl<A, B, Block, C, PR> Proposer<B, Block, C, A, PR>
 				self.transaction_pool.ready()
 			},
 		};
+
+		let mut block_size_limit = block_size_limit.unwrap_or(self.default_block_size_limit);
 
 		debug!("Attempting to push transactions from the pool.");
 		debug!("Pool status: {:?}", self.transaction_pool.status());
@@ -324,6 +348,15 @@ impl<A, B, Block, C, PR> Proposer<B, Block, C, A, PR>
 
 			let pending_tx_data = pending_tx.data().clone();
 			let pending_tx_hash = pending_tx.hash().clone();
+
+			let block_size = block_builder.estimate_block_size(
+				self.include_proof_in_block_size_estimation,
+			);
+			if block_size + pending_tx_data.encoded_size() > block_size_limit {
+				debug!("Reached block size limit, proceeding with proposing.");
+				break;
+			}
+
 			trace!("[{:?}] Pushing to the block.", pending_tx_hash);
 			match sc_block_builder::BlockBuilder::push(&mut block_builder, pending_tx_data) {
 				Ok(()) => {
@@ -367,7 +400,8 @@ impl<A, B, Block, C, PR> Proposer<B, Block, C, A, PR>
 			}
 		);
 
-		info!("🎁 Prepared block for proposing at {} [hash: {:?}; parent_hash: {}; extrinsics ({}): [{}]]",
+		info!(
+			"🎁 Prepared block for proposing at {} [hash: {:?}; parent_hash: {}; extrinsics ({}): [{}]]",
 			block.header().number(),
 			<Block as BlockT>::Hash::from(block.header().hash()),
 			block.header().parent_hash(),
@@ -394,7 +428,6 @@ impl<A, B, Block, C, PR> Proposer<B, Block, C, A, PR>
 			&block,
 			&self.parent_hash,
 			self.parent_number,
-			self.max_block_size,
 		) {
 			error!("Failed to evaluate authored block: {:?}", err);
 		}
