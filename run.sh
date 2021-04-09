@@ -1,2 +1,2 @@
 
-RUST_LOG=warn;babe=debug cargo run --bin substrate  -- --dev -d ./deploy/data  --execution=NativeElseWasm
+RUST_LOG=warn;babe=debug cargo run --release --bin substrate  -- --dev -d ./deploy/data  --execution=NativeElseWasm
