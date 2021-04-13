@@ -141,6 +141,13 @@ impl<P, Client> AuthorApi<TxHash<P>, BlockHash<P>> for Author<P, Client>
 		Ok(SyncCryptoStore::has_keys(&*self.keystore, &[(public_key.to_vec(), key_type)]))
 	}
 
+
+	/*
+	Substrate中把外部交易称做extrinsic。
+	RPC方法名是author_submitExtrinsic。
+	外部交易以十六进制编码形式，被导入交易池中。
+ 	*/
+
 	fn submit_extrinsic(&self, ext: Bytes) -> FutureResult<TxHash<P>> {
 		let xt = match Decode::decode(&mut &ext[..]) {
 			Ok(xt) => xt,
